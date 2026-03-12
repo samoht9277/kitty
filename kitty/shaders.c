@@ -16,6 +16,7 @@
 #include "srgb_gamma.h"
 #include "uniforms_generated.h"
 #include "state.h"
+#include "search.h"
 
 enum {
     CELL_PROGRAM, CELL_FG_PROGRAM, CELL_BG_PROGRAM, CELL_PROGRAM_SENTINEL,
@@ -787,6 +788,267 @@ draw_visual_bell(const UIRenderData *ui) {
 #undef COLOR
 }
 
+static void
+draw_search_highlights(const UIRenderData *ui) {
+    Screen *screen = ui->screen;
+    SearchState *search = &screen->search;
+    if (!search->is_active || search->match_count == 0 || search->query_ucs4_len == 0) return;
+
+    size_t hist_count = (screen->linebuf == screen->main_linebuf) ? screen->historybuf->count : 0;
+
+    size_t visible_start = (screen->scrolled_by > 0 && hist_count > 0 && (size_t)screen->scrolled_by <= hist_count)
+        ? (hist_count - (size_t)screen->scrolled_by)
+        : hist_count;
+    size_t visible_end = visible_start + screen->lines;
+
+    // Binary search for first match in visible range
+    size_t lo = 0, hi = search->match_count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (search->matches[mid].line < visible_start) lo = mid + 1;
+        else hi = mid;
+    }
+
+    unsigned cw = ui->cell_width;
+    unsigned ch = ui->cell_height;
+
+    for (size_t i = lo; i < search->match_count; i++) {
+        SearchMatch *m = &search->matches[i];
+        if (m->line >= visible_end) break;
+
+        unsigned visual_row = (unsigned)(m->line - visible_start);
+        unsigned x = ui->screen_left + (unsigned)(m->column * cw);
+        unsigned y = ui->screen_top + visual_row * ch + screen->pixel_scroll_offset_y;
+        unsigned w = (unsigned)(m->length * cw);
+        unsigned h = ch;
+
+        if (x + w > ui->screen_left + ui->screen_width) w = ui->screen_left + ui->screen_width - x;
+
+        bool is_current = (i == search->current_match);
+
+        save_viewport_using_top_left_origin(x, y, w, h, ui->full_framebuffer_height);
+        bind_program(TINT_PROGRAM);
+        if (is_current) {
+            // Focused: bright yellow (#FFDD00), 70% opacity
+            glUniform4f(tint_program_layout.uniforms.tint_color,
+                        srgb_color(255) * 0.70f, srgb_color(221) * 0.70f,
+                        srgb_color(0) * 0.70f, 0.70f);
+        } else {
+            // Unfocused: golden (#B8860B), 45% opacity
+            glUniform4f(tint_program_layout.uniforms.tint_color,
+                        srgb_color(184) * 0.45f, srgb_color(134) * 0.45f,
+                        srgb_color(11) * 0.45f, 0.45f);
+        }
+        glUniform4f(tint_program_layout.uniforms.edges, -1, 1, 1, -1);
+        draw_quad(true, 0);
+        restore_viewport();
+    }
+}
+
+static void
+draw_search_text(const UIRenderData *ui, uint8_t **canvas, size_t *cw, size_t *ch,
+                 char *cached_text, size_t cached_size, const char *text,
+                 unsigned left, unsigned top, unsigned max_w, color_type color) {
+    if (strcmp(text, cached_text) != 0) {
+        free(*canvas);
+        *canvas = NULL;
+        snprintf(cached_text, cached_size, "%s", text);
+        StringCanvas rendered = render_simple_text(ui->os_window->fonts_data, text);
+        if (rendered.canvas) {
+            *canvas = rendered.canvas;
+            *cw = rendered.width;
+            *ch = rendered.height;
+        }
+    }
+    if (!*canvas || !*cw || !*ch) return;
+    unsigned tw = (unsigned)*cw, th = (unsigned)*ch;
+    if (tw > max_w) tw = max_w;
+    if (!tw || !th) return;
+    bind_program(GRAPHICS_ALPHA_MASK_PROGRAM);
+    ImageRenderData *ird = load_alpha_mask_texture(tw, th, *canvas);
+    gpu_data_for_image(ird, -1, 1, 1, -1);
+    glUniform1i(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.image, GRAPHICS_UNIT);
+    color_vec3(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.amask_fg, color);
+    glUniform4f(graphics_program_layouts[GRAPHICS_ALPHA_MASK_PROGRAM].uniforms.amask_bg_premult, 0.f, 0.f, 0.f, 0.f);
+    save_viewport_using_top_left_origin(left, top, tw, th, ui->full_framebuffer_height);
+    draw_graphics(GRAPHICS_ALPHA_MASK_PROGRAM, ird, 0, 1, 1.f);
+    restore_viewport();
+}
+
+static bool
+has_printable_char(const char *text) {
+    for (const char *p = text; *p; p++) {
+        if (*p != ' ' && *p != '\t') return true;
+    }
+    return false;
+}
+
+static void
+update_text_cache(const UIRenderData *ui, uint8_t **canvas, size_t *cw, size_t *ch,
+                  char *cached_text, size_t cached_size, const char *text) {
+    if (strcmp(text, cached_text) != 0) {
+        free(*canvas);
+        *canvas = NULL;
+        *cw = 0;
+        *ch = 0;
+        snprintf(cached_text, cached_size, "%s", text);
+        if (text[0] && has_printable_char(text)) {
+            StringCanvas rendered = render_simple_text(ui->os_window->fonts_data, text);
+            if (rendered.canvas && rendered.width > 0 && rendered.height > 0) {
+                *canvas = rendered.canvas;
+                *cw = rendered.width;
+                *ch = rendered.height;
+            } else {
+                free(rendered.canvas);
+            }
+        }
+    }
+}
+
+static void
+draw_search_bar(const UIRenderData *ui) {
+    Screen *screen = ui->screen;
+    if (!screen->search.is_active) return;
+    SearchState *search = &screen->search;
+
+    unsigned cw = ui->cell_width;
+    unsigned ch = ui->cell_height;
+    unsigned hpad = cw;       // horizontal inner padding
+    unsigned vpad = ch / 2;   // vertical inner padding
+    unsigned margin = cw / 2; // outer margin from screen edge
+
+    // Fixed right section width for count display (e.g. "999/999" = ~9 chars)
+    unsigned count_section_w = 10 * cw;
+    unsigned separator_w = 1;  // 1px vertical line
+
+    // 1. Build text strings and update caches
+    char query_text[512];
+    char count_text[128];
+
+    if (search->query_utf8_len > 0) {
+        snprintf(query_text, sizeof(query_text), "%.*s",
+                 (int)search->query_utf8_len, search->query_utf8);
+    } else {
+        snprintf(query_text, sizeof(query_text), "Search...");
+    }
+
+    size_t mc = search->match_count;
+    size_t cm = search->current_match;
+    if (mc > 0 && search->query_utf8_len > 0) {
+        if (mc >= SEARCH_MAX_MATCHES) {
+            snprintf(count_text, sizeof(count_text), "%d+", SEARCH_MAX_MATCHES);
+        } else {
+            snprintf(count_text, sizeof(count_text), "%zu/%zu", cm + 1, mc);
+        }
+    } else if (search->query_utf8_len > 0) {
+        snprintf(count_text, sizeof(count_text), "0 results");
+    } else {
+        count_text[0] = '\0';
+    }
+
+    update_text_cache(ui, &search->cached_query_canvas,
+                      &search->cached_query_width, &search->cached_query_height,
+                      search->cached_query_text, sizeof(search->cached_query_text), query_text);
+    update_text_cache(ui, &search->cached_count_canvas,
+                      &search->cached_count_width, &search->cached_count_height,
+                      search->cached_count_text, sizeof(search->cached_count_text), count_text);
+
+    // 2. Layout: [hpad | query ... | sep | count_section | hpad]
+    unsigned query_w = search->cached_query_canvas ? (unsigned)search->cached_query_width : 0;
+    unsigned query_zone_w = query_w + 2 * hpad;
+    unsigned min_query_zone = 15 * cw;
+    if (query_zone_w < min_query_zone) query_zone_w = min_query_zone;
+    unsigned bar_width = query_zone_w + separator_w + count_section_w;
+    unsigned max_width = (unsigned)(ui->screen_width * 0.6f);
+    if (bar_width > max_width) bar_width = max_width;
+    unsigned bar_height = ch + 2 * vpad;
+
+    unsigned bar_left = ui->screen_left + ui->screen_width - bar_width - margin;
+    unsigned bar_top = ui->screen_top + margin;
+
+    // 3. Theme colors
+    unsigned corner_radius = ch / 3;
+    if (corner_radius < 6) corner_radius = 6;
+    Viewport rect = { .left = bar_left, .top = bar_top, .width = bar_width, .height = bar_height };
+
+    ColorProfile *cp = screen->color_profile;
+    color_type bg_color = colorprofile_to_color(cp, cp->overridden.default_bg, cp->configured.default_bg).rgb;
+    color_type fg_color = colorprofile_to_color(cp, cp->overridden.default_fg, cp->configured.default_fg).rgb;
+
+    unsigned bg_r = (bg_color >> 16) & 0xFF, bg_g = (bg_color >> 8) & 0xFF, bg_b = bg_color & 0xFF;
+    unsigned fg_r = (fg_color >> 16) & 0xFF, fg_g = (fg_color >> 8) & 0xFF, fg_b = fg_color & 0xFF;
+    unsigned r = (unsigned)(bg_r * 0.85f + fg_r * 0.15f);
+    unsigned g = (unsigned)(bg_g * 0.85f + fg_g * 0.15f);
+    unsigned b = (unsigned)(bg_b * 0.85f + fg_b * 0.15f);
+    color_type bar_bg = (r << 16) | (g << 8) | b;
+    color_type bar_fg = fg_color;
+
+    // 4. Draw filled rounded background
+    bind_program(ROUNDED_RECT_PROGRAM);
+    color_vec4(rounded_rect_program_layout.uniforms.color, bar_bg, 0.92f);
+    color_vec4(rounded_rect_program_layout.uniforms.background_color, 0, 0.0f);
+    float fy = (float)ui->full_framebuffer_height - (float)(rect.top + rect.height);
+    glUniform4f(rounded_rect_program_layout.uniforms.rect, rect.left, fy, rect.width, rect.height);
+    glUniform2f(rounded_rect_program_layout.uniforms.params, (float)(rect.width + rect.height), (float)corner_radius);
+    save_viewport_using_top_left_origin(rect.left, rect.top, rect.width, rect.height, ui->full_framebuffer_height);
+    draw_quad(true, 0);
+    restore_viewport();
+
+    // 5. Draw rounded border
+    unsigned br_c = (unsigned)(bg_r * 0.7f + fg_r * 0.3f);
+    unsigned bg_c = (unsigned)(bg_g * 0.7f + fg_g * 0.3f);
+    unsigned bb_c = (unsigned)(bg_b * 0.7f + fg_b * 0.3f);
+    color_type border_color = (br_c << 16) | (bg_c << 8) | bb_c;
+    draw_rounded_rect(ui->os_window, rect, ui->full_framebuffer_height,
+                      1, corner_radius, border_color, 0, 0.0f);
+
+    // 6. Draw vertical separator line between query and count
+    unsigned sep_x = bar_left + bar_width - count_section_w - separator_w;
+    unsigned sep_top = bar_top + vpad / 2;
+    unsigned sep_height = bar_height - vpad;
+    save_viewport_using_top_left_origin(sep_x, sep_top, separator_w, sep_height,
+                                        ui->full_framebuffer_height);
+    bind_program(TINT_PROGRAM);
+    glUniform4f(tint_program_layout.uniforms.tint_color,
+                srgb_color(br_c) * 0.6f, srgb_color(bg_c) * 0.6f,
+                srgb_color(bb_c) * 0.6f, 0.6f);
+    glUniform4f(tint_program_layout.uniforms.edges, -1, 1, 1, -1);
+    draw_quad(true, 0);
+    restore_viewport();
+
+    // Text vertical position: center the cell height within the bar
+    unsigned text_top = bar_top + vpad;
+
+    // 7. Draw count text (centered in the fixed right section)
+    if (search->cached_count_canvas) {
+        unsigned count_tw = (unsigned)search->cached_count_width;
+        unsigned count_zone_left = sep_x + separator_w;
+        unsigned cl = count_zone_left + (count_section_w - count_tw) / 2;
+        unsigned ct = text_top;
+        // Dimmed count color
+        unsigned cr2 = (bar_fg >> 16) & 0xFF, cg2 = (bar_fg >> 8) & 0xFF, cb2 = bar_fg & 0xFF;
+        cr2 = (unsigned)(cr2 * 0.6f + ((bar_bg >> 16) & 0xFF) * 0.4f);
+        cg2 = (unsigned)(cg2 * 0.6f + ((bar_bg >> 8) & 0xFF) * 0.4f);
+        cb2 = (unsigned)(cb2 * 0.6f + (bar_bg & 0xFF) * 0.4f);
+        color_type count_color = (cr2 << 16) | (cg2 << 8) | cb2;
+        draw_search_text(ui, &search->cached_count_canvas,
+                        &search->cached_count_width, &search->cached_count_height,
+                        search->cached_count_text, sizeof(search->cached_count_text),
+                        count_text, cl, ct, count_tw, count_color);
+    }
+
+    // 8. Draw query text (left-aligned, clipped to query zone)
+    if (search->cached_query_canvas) {
+        unsigned ql = bar_left + hpad;
+        unsigned qt = text_top;
+        unsigned qmax = bar_width - count_section_w - separator_w - 2 * hpad;
+        draw_search_text(ui, &search->cached_query_canvas,
+                        &search->cached_query_width, &search->cached_query_height,
+                        search->cached_query_text, sizeof(search->cached_query_text),
+                        query_text, ql, qt, qmax, bar_fg);
+    }
+}
+
 static bool
 has_scrollbar(Window *w, Screen *screen) {
     if (screen->linebuf != screen->main_linebuf || !screen->historybuf->count) return false;
@@ -1110,6 +1372,8 @@ call_cell_program(int program, const UIRenderData *ui, ssize_t vao_idx, bool for
 static void
 draw_cells_without_layers(const UIRenderData *ui, ssize_t vao_idx) {
     call_cell_program(CELL_PROGRAM, ui, vao_idx, true, DRAW_BOTH_BG);
+    draw_search_highlights(ui);
+    draw_search_bar(ui);
 }
 
 static void
@@ -1140,6 +1404,8 @@ draw_cells_with_layers(const UIRenderData *ui, ssize_t vao_idx) {
             GRAPHICS_PROGRAM, ui->grd.images, ui->grd.num_of_below_refs + ui->grd.num_of_negative_refs,
             ui->grd.num_of_positive_refs, ui->inactive_text_alpha);
 
+    draw_search_highlights(ui);
+    draw_search_bar(ui);
     draw_visual_bell(ui);
     draw_scrollbar(ui);
     draw_hyperlink_target(ui);

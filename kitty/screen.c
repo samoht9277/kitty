@@ -162,6 +162,7 @@ new_screen_object(PyTypeObject *type, PyObject *args, PyObject UNUSED *kwds) {
         init_tabstops(self->alt_tabstops, self->columns);
         self->key_encoding_flags = self->main_key_encoding_flags;
         if (!init_overlay_line(self, self->columns, false)) { Py_CLEAR(self); return NULL; }
+        search_init(&self->search);
         self->hyperlink_pool = alloc_hyperlink_pool();
         if (!self->hyperlink_pool) { Py_CLEAR(self); return PyErr_NoMemory(); }
         self->as_ansi_buf.hyperlink_pool = self->hyperlink_pool;
@@ -671,6 +672,7 @@ dealloc(Screen* self) {
     free(self->url_ranges.items);
     free(self->paused_rendering.url_ranges.items);
     free(self->paused_rendering.selections.items);
+    search_destroy(&self->search);
     free_hyperlink_pool(self->hyperlink_pool);
     free(self->as_ansi_buf.buf);
     free(self->last_rendered_window_char.canvas);
@@ -1212,6 +1214,7 @@ static void
 draw_text(Screen *self, const uint32_t *chars, size_t num_chars) {
     PREPARE_FOR_DRAW_TEXT;
     self->is_dirty = true;
+    if (self->search.is_active && self->search.query_ucs4_len > 0) self->search.content_dirty = true;
     draw_text_loop(self, chars, num_chars, &s);
 }
 
@@ -2063,6 +2066,7 @@ screen_cursor_to_column(Screen *self, unsigned int column) {
     } \
     linebuf_clear_line(self->linebuf, bottom, true); \
     self->is_dirty = true; \
+    if (self->search.is_active && self->search.query_ucs4_len > 0) self->search.content_dirty = true; \
     index_selection(self, &self->selections, true, top, bottom); \
     clear_selection(&self->url_ranges);
 
@@ -5859,6 +5863,79 @@ current_selections(Screen *self, PyObject *a UNUSED) {
 WRAP0(update_only_line_graphics_data)
 WRAP0(bell)
 
+static PyObject*
+screen_search_activate(Screen *self, PyObject *args UNUSED) {
+    search_activate(&self->search);
+    Py_RETURN_NONE;
+}
+
+static PyObject*
+screen_search_deactivate(Screen *self, PyObject *args UNUSED) {
+    search_deactivate(&self->search);
+    Py_RETURN_NONE;
+}
+
+static PyObject*
+screen_search_set_query(Screen *self, PyObject *args) {
+    const char *query;
+    Py_ssize_t query_len;
+    if (!PyArg_ParseTuple(args, "s#", &query, &query_len)) return NULL;
+    if (search_set_query(&self->search, query, (size_t)query_len)) {
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+static PyObject*
+screen_search_run_scan(Screen *self, PyObject *args UNUSED) {
+    search_run_scan(&self->search, self);
+    Py_RETURN_NONE;
+}
+
+static PyObject*
+screen_search_is_active(Screen *self, PyObject *args UNUSED) {
+    if (search_is_active(&self->search)) Py_RETURN_TRUE;
+    Py_RETURN_FALSE;
+}
+
+static PyObject*
+screen_search_check_content_dirty(Screen *self, PyObject *args UNUSED) {
+    if (self->search.content_dirty) {
+        self->search.content_dirty = false;
+        Py_RETURN_TRUE;
+    }
+    Py_RETURN_FALSE;
+}
+
+static PyObject*
+screen_search_match_count(Screen *self, PyObject *args UNUSED) {
+    return PyLong_FromSize_t(self->search.match_count);
+}
+
+static PyObject*
+screen_search_current_match(Screen *self, PyObject *args UNUSED) {
+    return PyLong_FromSize_t(self->search.current_match);
+}
+
+static PyObject*
+screen_search_next(Screen *self, PyObject *args UNUSED) {
+    SearchState *s = &self->search;
+    if (s->match_count == 0) Py_RETURN_NONE;
+    s->current_match = (s->current_match + 1) % s->match_count;
+    search_scroll_to_match(s, self);
+    Py_RETURN_NONE;
+}
+
+static PyObject*
+screen_search_prev(Screen *self, PyObject *args UNUSED) {
+    SearchState *s = &self->search;
+    if (s->match_count == 0) Py_RETURN_NONE;
+    if (s->current_match == 0) s->current_match = s->match_count - 1;
+    else s->current_match--;
+    search_scroll_to_match(s, self);
+    Py_RETURN_NONE;
+}
+
 #define MND(name, args) {#name, (PyCFunction)name, args, #name},
 #define MODEFUNC(name) MND(name, METH_NOARGS) MND(set_##name, METH_O)
 
@@ -6047,6 +6124,16 @@ static PyMethodDef methods[] = {
     MND(bell, METH_NOARGS)
     MND(current_selections, METH_NOARGS)
     {"select_graphic_rendition", (PyCFunction)_select_graphic_rendition, METH_VARARGS, ""},
+    {"search_activate", (PyCFunction)screen_search_activate, METH_NOARGS, ""},
+    {"search_deactivate", (PyCFunction)screen_search_deactivate, METH_NOARGS, ""},
+    {"search_set_query", (PyCFunction)screen_search_set_query, METH_VARARGS, ""},
+    {"search_run_scan", (PyCFunction)screen_search_run_scan, METH_NOARGS, ""},
+    {"search_is_active", (PyCFunction)screen_search_is_active, METH_NOARGS, ""},
+    {"search_check_content_dirty", (PyCFunction)screen_search_check_content_dirty, METH_NOARGS, ""},
+    {"search_match_count", (PyCFunction)screen_search_match_count, METH_NOARGS, ""},
+    {"search_current_match", (PyCFunction)screen_search_current_match, METH_NOARGS, ""},
+    {"search_next", (PyCFunction)screen_search_next, METH_NOARGS, ""},
+    {"search_prev", (PyCFunction)screen_search_prev, METH_NOARGS, ""},
 
     {NULL}  /* Sentinel */
 };

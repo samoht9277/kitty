@@ -715,6 +715,9 @@ class Window:
         self.child_is_launched = False
         self.last_reported_pty_size = (-1, -1, -1, -1)
         self._pause_resize_notifications_to_child: tuple[int, int, int, int] | None = None
+        self._search_query_text: str = ''
+        self._search_debounce_timer: Optional[int] = None
+        self._search_content_timer: Optional[int] = None
         self.needs_attention = False
         self.ignore_focus_changes = self.initial_ignore_focus_changes
         self.override_title = override_title
@@ -1006,6 +1009,9 @@ class Window:
         if self.needs_layout or new_geometry.xnum != self.screen.columns or render_ynum != self.screen.lines:
             self.screen.resize(max(0, render_ynum), max(0, new_geometry.xnum))
             self.needs_layout = False
+            if self.screen.search_is_active() and self._search_query_text:
+                self.screen.search_set_query(self._search_query_text)
+                self.screen.search_run_scan()
             call_watchers(weakref.ref(self), 'on_resize', {'old_geometry': self.geometry, 'new_geometry': new_geometry})
         current_pty_size = (
             self.screen.lines, self.screen.columns,
@@ -2252,6 +2258,116 @@ class Window:
                     sanitized = sanitized.replace(b'\n', b'\x1bE')
                 w.screen.paste_bytes(sanitized)
                 w.send_key('enter')
+
+    def _search_update_query(self) -> None:
+        """Update query text immediately (for display) and debounce the scan."""
+        self.screen.search_set_query(self._search_query_text)
+        if self._search_debounce_timer is not None:
+            from kitty.fast_data_types import remove_timer
+            remove_timer(self._search_debounce_timer)
+            self._search_debounce_timer = None
+        if self._search_query_text:
+            self._search_debounce_timer = add_timer(self._search_run_scan, 0.05, False)
+        else:
+            self.screen.search_run_scan()
+        self.refresh()
+
+    def _search_run_scan(self, timer_id: Optional[int] = None) -> None:
+        self._search_debounce_timer = None
+        if self.screen.search_is_active():
+            self.screen.search_run_scan()
+            self.refresh()
+
+    def _search_check_content(self, timer_id: Optional[int] = None) -> None:
+        if self.screen.search_is_active() and self._search_query_text:
+            if self.screen.search_check_content_dirty():
+                self.screen.search_run_scan()
+                self.refresh()
+
+    def _search_start_content_timer(self) -> None:
+        self._search_stop_content_timer()
+        self._search_content_timer = add_timer(self._search_check_content, 0.2, True)
+
+    def _search_stop_content_timer(self) -> None:
+        if self._search_content_timer is not None:
+            from kitty.fast_data_types import remove_timer
+            remove_timer(self._search_content_timer)
+            self._search_content_timer = None
+
+    @ac('sc', 'Toggle search overlay for finding text in scrollback')
+    def toggle_search(self) -> None:
+        if self.screen.search_is_active():
+            self.screen.search_deactivate()
+            self._search_query_text = ''
+            self._search_stop_content_timer()
+        else:
+            self.screen.search_activate()
+            self._search_query_text = ''
+            self._search_start_content_timer()
+        self.refresh()
+
+    def handle_search_key_event(self, ev: 'KeyEvent') -> bool:
+        """Handle a key event when search is active. Returns True if consumed."""
+        from kitty.fast_data_types import (
+            GLFW_FKEY_ESCAPE, GLFW_FKEY_ENTER, GLFW_FKEY_BACKSPACE,
+            GLFW_MOD_SHIFT, GLFW_MOD_SUPER, GLFW_MOD_CONTROL,
+            GLFW_PRESS, GLFW_REPEAT,
+        )
+        import sys
+
+        if ev.action not in (GLFW_PRESS, GLFW_REPEAT):
+            return True  # consume release events
+
+        key = ev.key
+        mods = ev.mods
+        cmd_mod = GLFW_MOD_SUPER if sys.platform == 'darwin' else GLFW_MOD_CONTROL
+
+        # Escape: close search
+        if key == GLFW_FKEY_ESCAPE:
+            self.screen.search_deactivate()
+            self._search_query_text = ''
+            self._search_stop_content_timer()
+            self.refresh()
+            return True
+
+        # Enter / Shift+Enter: navigate matches
+        if key == GLFW_FKEY_ENTER:
+            if mods & GLFW_MOD_SHIFT:
+                self.screen.search_prev()
+            else:
+                self.screen.search_next()
+            self.refresh()
+            return True
+
+        # Backspace
+        if key == GLFW_FKEY_BACKSPACE:
+            if mods & cmd_mod:
+                self._search_query_text = ''
+            elif self._search_query_text:
+                self._search_query_text = self._search_query_text[:-1]
+            self._search_update_query()
+            return True
+
+        # Paste: Cmd+V (macOS) or Ctrl+V (Linux)
+        if key == ord('v') and (mods & cmd_mod):
+            from kitty.clipboard import get_clipboard_string
+            try:
+                text = get_clipboard_string()
+                if text:
+                    text = text.replace('\n', ' ').replace('\r', '')
+                    self._search_query_text += text
+            except Exception:
+                pass
+            self._search_update_query()
+            return True
+
+        # Printable text
+        if ev.text:
+            self._search_query_text += ev.text
+            self._search_update_query()
+            return True
+
+        return True  # consume all keys when search is active
 
     def show_cmd_output(self, which: CommandOutput, title: str = 'Command output', as_ansi: bool = True, add_wrap_markers: bool = True) -> None:
         text = self.cmd_output(which, as_ansi=as_ansi, add_wrap_markers=add_wrap_markers)
