@@ -6,7 +6,7 @@ from enum import IntFlag
 from functools import partial
 from typing import NamedTuple
 
-from .fast_data_types import BORDERS_PROGRAM, current_focused_os_window_id, get_options, init_borders_program, set_borders_rects
+from .fast_data_types import BORDERS_PROGRAM, current_focused_os_window_id, get_options, init_borders_program, set_borders_rects, viewport_for_window
 from .shaders import program_for
 from .typing_compat import LayoutType
 from .utils import color_as_int
@@ -128,4 +128,45 @@ class Borders:
         if draw_minimal_borders:
             for border_line in current_layout.get_minimal_borders(all_windows):
                 rects.append(Border(*border_line.edges, border_line.color, border_line.window_id, border_line.horizontal))
+            # Add colored borders on outer edges (edges touching the viewport boundary)
+            if draw_borders and num_visible_groups > 1:
+                try:
+                    central, tab_bar, vw, vh, cell_width, cell_height = viewport_for_window(self.os_window_id)
+                except Exception:
+                    central = None
+                if central is not None:
+                    margin = bw + cell_height  # generous threshold for detecting outer edges
+                    for wg in groups:
+                        geometry = wg.geometry
+                        if geometry is None:
+                            continue
+                        if wg is active_group and draw_active_borders:
+                            color = BorderColor.active
+                        else:
+                            color = BorderColor.bell if wg.needs_attention else BorderColor.inactive
+                        pl, pt = wg.effective_padding('left'), wg.effective_padding('top')
+                        pr, pb = wg.effective_padding('right'), wg.effective_padding('bottom')
+                        left = geometry.left - pl
+                        top = geometry.top - pt
+                        right = geometry.right + pr
+                        bottom = geometry.bottom + pb
+                        wid = wg.active_window_id
+                        # Detect which sides are outer edges
+                        at_top = top <= central.top + margin
+                        at_bottom = bottom >= central.bottom - margin
+                        at_left = left <= central.left + margin
+                        at_right = right >= central.right - margin
+                        # Borders at content edge, bw-thick, corners overlap
+                        hleft = left - bw if at_left else left
+                        hright = right + bw if at_right else right
+                        vtop = top - bw if at_top else top
+                        vbottom = bottom + bw if at_bottom else bottom
+                        if at_top:
+                            rects.append(Border(hleft, top - bw, hright, top, color, -wid, True))
+                        if at_bottom:
+                            rects.append(Border(hleft, bottom, hright, bottom + bw, color, wid, True))
+                        if at_left:
+                            rects.append(Border(left - bw, vtop, left, vbottom, color, -wid, False))
+                        if at_right:
+                            rects.append(Border(right, vtop, right + bw, vbottom, color, wid, False))
         set_borders_rects(self.os_window_id, self.tab_id, rects)
